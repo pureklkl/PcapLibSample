@@ -1,14 +1,4 @@
-/**********************************************************************
-* file:   testpcap3.c
-* date:   Sat Apr 07 23:23:02 PDT 2001  
-* Author: Martin Casado
-* Last Modified:2001-Apr-07 11:23:05 PM
-*
-* Investigate using filter programs with pcap_compile() and
-* pcap_setfilter()
-*
-**********************************************************************/
-
+//Author: Yuanfan Peng Sep. 10th 2018
 #include <pcap.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,16 +9,23 @@
 #include <netinet/if_ether.h> 
 #include <signal.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #define UNUSED(x) (void)(x)
 
 sigset_t set;
 
 typedef struct PcapInfo {
-    pcap_t* descr;
+    int descr;
     long packetCnt; 
     long volume; // in byte
 }PcapInfo;
+
+typedef struct OutputInfo {
+   int id;
+   unsigned char * buffer;
+   size_t curSize;
+}OutputInfo;
 
 void * quitMonitor(void * args) {
   PcapInfo* pcapInfo = (PcapInfo *)args;
@@ -40,7 +37,7 @@ void * quitMonitor(void * args) {
   int sig; 
   sigwait(&set, &sig);
 #endif
-  pcap_breakloop(pcapInfo->descr);
+  close(pcapInfo->descr);
   fprintf(stdout, "\n%ld packets, %ld Bytes\n", pcapInfo->packetCnt, pcapInfo->volume);
   fflush(stdout);
   return NULL;
@@ -62,60 +59,72 @@ void setQuitMonitor(pthread_t* monitorTh, PcapInfo* info) {
   //pthread_detach(monitorTh);
 }
 
-
-/* print count and volume  */
-void my_callback(u_char *args,const struct pcap_pkthdr* pkthdr,const u_char*
-        packet)
-{
-    PcapInfo* pcapInfo = (PcapInfo *)args;
-    UNUSED(packet);
-    pcapInfo->volume += pkthdr->len;
-    pcapInfo->packetCnt++;
+void * output(void* args) {
+  OutputInfo* outputInfo = (OutputInfo *)args;
+  char buffer[20];
+  sprintf(buffer, "./o/%d", outputInfo->id);
+  FILE *fp = fopen(buffer, "wb");
+  fwrite(outputInfo->buffer, 1, outputInfo->curSize, fp);
+  free(outputInfo->buffer);
+  free(outputInfo);
+  fclose(fp);
+  return NULL;
 }
 
-int main(int argc,char **argv)
+int main()
 { 
-    char *dev; 
-    char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* descr;
-    struct bpf_program fp;      /* hold compiled program     */
-    bpf_u_int32 maskp;          /* subnet mask               */
-    bpf_u_int32 netp;           /* ip                        */
-    PcapInfo pcapInfo;
+    int PER_OUTPUT_SIZE = 1024 * 1024 * 1; // MB
+    PcapInfo pcapInfo;  
+    int data_size;
+    struct sockaddr saddr;
+    socklen_t saddr_size = sizeof(saddr);     
     pthread_t monitorTh;
+    pthread_t outputTh;
+    int id = 0;
+    OutputInfo* outputInfo = (OutputInfo *)malloc(sizeof(outputInfo));
+    outputInfo->buffer = (unsigned char *) malloc(PER_OUTPUT_SIZE); //Its Big!
+    outputInfo->curSize = 0;
+    outputInfo->id = id;      
 
-    if(argc != 2){ fprintf(stdout,"Usage: %s \"filter program\"\n"
-            ,argv[0]);return 0;}
 
-    /* grab a device to peak into... */
-    dev = pcap_lookupdev(errbuf);
-    if(dev == NULL)
-    { fprintf(stderr,"%s\n",errbuf); exit(1); }
+    int sock_raw = socket( AF_PACKET , SOCK_RAW , htons(ETH_P_ALL)) ;
+     
+    if(sock_raw < 0)
+    {
+        //Print the error with proper message
+        perror("Socket Error");
+        return 1;
+    }
 
-    /* ask pcap for the network address and mask of the device */
-    pcap_lookupnet(dev,&netp,&maskp,errbuf);
-
-    /* open device for reading this time lets set it in promiscuous
-     * mode so we can monitor traffic to another machine             */
-    descr = pcap_open_live(dev,BUFSIZ,1,-1,errbuf);
-    if(descr == NULL)
-    { printf("pcap_open_live(): %s\n",errbuf); exit(1); }
-
-    /* Lets try and compile the program.. non-optimized */
-    if(pcap_compile(descr,&fp,argv[1],0,netp) == -1)
-    { fprintf(stderr,"Error calling pcap_compile\n"); exit(1); }
-
-    /* set the compiled program as the filter */
-    if(pcap_setfilter(descr,&fp) == -1)
-    { fprintf(stderr,"Error setting filter\n"); exit(1); }
     
-    pcapInfo.descr = descr;
+    pcapInfo.descr = sock_raw;
     pcapInfo.volume = 0L;
     pcapInfo.packetCnt = 0L; 
     setQuitMonitor(&monitorTh, &pcapInfo);
-   
-    /* ... and loop */ 
-    pcap_loop(descr,-1,my_callback,(u_char *)&pcapInfo);
+    
+    while(1)
+    {
+        //Receive a packet
+        data_size = recvfrom(sock_raw , outputInfo->buffer + outputInfo->curSize, PER_OUTPUT_SIZE - outputInfo->curSize, 0 , &saddr , &saddr_size);
 
+        if(data_size <0 )
+        {
+            printf("Recvfrom error , failed to get packets\n");
+            break;
+        }
+        outputInfo->curSize += data_size;
+        if (PER_OUTPUT_SIZE - outputInfo->curSize < 1500) {
+            pthread_create(&outputTh, NULL, output, outputInfo);
+            //pthread_detach(outputTh);
+ 	
+	    outputInfo = (OutputInfo *)malloc(sizeof(outputInfo));
+    	    outputInfo->buffer = (unsigned char *) malloc(PER_OUTPUT_SIZE); //Its Big!
+    	    outputInfo->curSize = 0;
+    	    outputInfo->id = ++id;      
+	}
+        pcapInfo.packetCnt++;
+        pcapInfo.volume += data_size;
+    }
+    output(outputInfo);
     return 0;
 }
